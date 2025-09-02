@@ -1,0 +1,134 @@
+from flask import Flask, request, jsonify, render_template_string
+from flask_cors import CORS
+import datetime
+import sqlite3
+import matplotlib.pyplot as plt
+from io import BytesIO
+import os
+
+app = Flask(__name__)
+CORS(app)
+
+DB_PATH = "recordings.db"
+STATIC_DIR = "static"
+os.makedirs(STATIC_DIR, exist_ok=True)
+
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Latest Recordings Visualization</title>
+</head>
+<body>
+    <h1>Latest Recordings Visualization</h1>
+    {% for location in locations %}
+        <h2>{{ location }}</h2>
+        <img src="/static/{{ location }}.png" alt="{{ location }} plot">
+    {% endfor %}
+</body>
+</html>
+'''
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS recordings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                location TEXT,
+                sample_index INTEGER,
+                value REAL
+            )
+        ''')
+        conn.commit()
+
+init_db()
+
+@app.route('/')
+def home():
+    return "Hello World"
+
+@app.route('/data', methods=['GET', 'POST'])
+def data_endpoint():
+    if request.method == 'POST':
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No JSON data received"}), 400
+
+        timestamp = data.get("timestamp")
+        location = data.get("location")
+        samples = data.get("data")
+
+        if not timestamp or not location or not samples:
+            return jsonify({"error": "Missing required fields"}), 400
+
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            for i, val in enumerate(samples):
+                voltage = round((val / 255.0) * 3.3, 2)
+                c.execute(
+                    "INSERT INTO recordings (timestamp, location, sample_index, value) VALUES (?, ?, ?, ?)",
+                    (timestamp, location, i, voltage)
+                )
+            conn.commit()
+
+        print(f"[{datetime.datetime.now()}] Stored {location} with {len(samples)} samples")
+        return jsonify({"status": "success", "received": location}), 200
+
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT timestamp, location, sample_index, value FROM recordings ORDER BY timestamp, location, sample_index")
+        rows = c.fetchall()
+
+    data = {}
+    for ts, loc, idx, val in rows:
+        if ts not in data:
+            data[ts] = {}
+        if loc not in data[ts]:
+            data[ts][loc] = []
+        data[ts][loc].append(val)
+
+    return jsonify(data)
+
+@app.route('/visualization', methods=['GET'])
+def visualize():
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT DISTINCT timestamp FROM recordings ORDER BY timestamp DESC")
+        timestamps = c.fetchall()
+
+        if not timestamps:
+            return "No data available", 404
+
+        latest_timestamp = timestamps[0][0]
+
+        c.execute("SELECT location, sample_index, value FROM recordings WHERE timestamp = ? ORDER BY location, sample_index",
+                  (latest_timestamp,))
+        rows = c.fetchall()
+
+    data = {}
+    for loc, idx, val in rows:
+        if loc not in data:
+            data[loc] = []
+        data[loc].append(val)
+
+    locations = list(data.keys())
+
+    for loc in locations:
+        voltages = data[loc]
+        x_axis = list(range(1, len(voltages) + 1))
+        fig, ax = plt.subplots()
+        ax.plot(x_axis, voltages, marker='o', markersize=3, linewidth=1)
+        ax.set_title(f"Location: {loc}")
+        ax.set_xlabel("Sample Index")
+        ax.set_ylabel("Voltage (V)")
+        plt.tight_layout()
+        plot_path = os.path.join(STATIC_DIR, f"{loc}.png")
+        fig.savefig(plot_path)
+        plt.close(fig)
+
+    return render_template_string(HTML_TEMPLATE, locations=locations)
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
